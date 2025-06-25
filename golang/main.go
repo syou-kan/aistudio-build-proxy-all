@@ -25,12 +25,18 @@ const (
 
 // --- 1. 连接管理与负载均衡 ---
 
+// ErrRateLimited 表示由于速率限制，请求被拒绝
+var ErrRateLimited = errors.New("rate limited")
+
 // UserConnection 存储单个WebSocket连接及其元数据
 type UserConnection struct {
 	Conn       *websocket.Conn
 	UserID     string
 	LastActive time.Time
 	writeMutex sync.Mutex // 保护对此单个连接的并发写入
+	IsHealthy  bool       // 标记连接是否健康
+	Status     string     // 更详细的状态描述 (e.g., "active", "unhealthy")
+	lastError  error      // 此连接上发生的最后一次错误
 }
 
 // safeWriteJSON 线程安全地向单个WebSocket连接写入JSON
@@ -43,8 +49,9 @@ func (uc *UserConnection) safeWriteJSON(v interface{}) error {
 // UserConnections 维护单个用户的所有连接和负载均衡状态
 type UserConnections struct {
 	sync.Mutex
-	Connections []*UserConnection
-	NextIndex   int // 用于轮询 (round-robin)
+	Connections         []*UserConnection
+	NextIndex           int       // 用于轮询 (round-robin)
+	circuitBreakerUntil time.Time // 熔断器激活到的时间点
 }
 
 // ConnectionPool 全局连接池，并发安全
@@ -63,6 +70,9 @@ func (p *ConnectionPool) AddConnection(userID string, conn *websocket.Conn) *Use
 		Conn:       conn,
 		UserID:     userID,
 		LastActive: time.Now(),
+		IsHealthy:  true,
+		Status:     "active",
+		lastError:  nil,
 	}
 
 	p.Lock()
@@ -115,31 +125,42 @@ func (p *ConnectionPool) RemoveConnection(userID string, conn *websocket.Conn) {
 	}
 }
 
-// GetConnection 使用轮询策略为用户选择一个连接
+// GetConnection 智能轮询，为用户选择一个健康的连接
 func (p *ConnectionPool) GetConnection(userID string) (*UserConnection, error) {
 	p.RLock()
 	userConns, exists := p.Users[userID]
 	p.RUnlock()
 
 	if !exists {
-		return nil, errors.New("no available client for this user")
+		return nil, errors.New("no user connections available for this user")
 	}
 
 	userConns.Lock()
 	defer userConns.Unlock()
 
-	numConns := len(userConns.Connections)
-	if numConns == 0 {
-		// 理论上如果存在于p.Users中，这里不应该为0，但为了健壮性还是检查
-		return nil, errors.New("no available client for this user")
+	// --- 熔断检查 ---
+	if time.Now().Before(userConns.circuitBreakerUntil) {
+		return nil, ErrRateLimited
 	}
 
-	// 轮询负载均衡
-	idx := userConns.NextIndex % numConns
-	selectedConn := userConns.Connections[idx]
-	userConns.NextIndex = (userConns.NextIndex + 1) % numConns // 更新索引
+	numConns := len(userConns.Connections)
+	if numConns == 0 {
+		return nil, errors.New("no healthy client available for this user")
+	}
 
-	return selectedConn, nil
+	// 从 NextIndex 开始，最多遍历一轮
+	for i := 0; i < numConns; i++ {
+		idx := (userConns.NextIndex + i) % numConns
+		conn := userConns.Connections[idx]
+		if conn.IsHealthy {
+			// 找到一个健康的连接
+			userConns.NextIndex = (idx + 1) % numConns // 更新下一次开始的位置
+			return conn, nil
+		}
+	}
+
+	// 遍历完所有连接都没有找到健康的
+	return nil, errors.New("no healthy client available for this user")
 }
 
 // --- 2. WebSocket 消息结构 & 待处理请求 ---
@@ -191,9 +212,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // readPump 处理来自单个WebSocket连接的所有传入消息
 func readPump(uc *UserConnection) {
 	defer func() {
+		// 在移除前标记为不健康，防止在移除完成前的瞬间被其他协程获取
+		uc.IsHealthy = false
+		uc.Status = "unhealthy"
+		uc.lastError = errors.New("connection closed in readPump")
+
 		globalPool.RemoveConnection(uc.UserID, uc.Conn)
 		uc.Conn.Close()
-		log.Printf("readPump closed for user %s", uc.UserID)
+		log.Printf("readPump closed for user %s, connection marked as unhealthy.", uc.UserID)
 	}()
 
 	// 设置读取超时 (心跳机制)
@@ -268,15 +294,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	pendingRequests.Store(reqID, respChan)
 	defer pendingRequests.Delete(reqID) // 确保请求结束后清理
 
-	// 4. 选择一个WebSocket连接
-	selectedConn, err := globalPool.GetConnection(userID)
-	if err != nil {
-		log.Printf("Error getting connection for user %s: %v", userID, err)
-		http.Error(w, "Service Unavailable: No active client connected", http.StatusServiceUnavailable)
-		return
-	}
-
-	// 5. 封装HTTP请求为WS消息
+	// 5. 封装HTTP请求为WS消息 (在循环外执行以避免重复读取body)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
@@ -284,11 +302,8 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// 注意：将Header直接序列化为JSON可能需要一些处理，这里简化处理
-	// 对于生产环境，可能需要更精细的Header转换
 	headers := make(map[string][]string)
 	for k, v := range r.Header {
-		// 过滤掉一些HTTP/1.1特有的或代理不应转发的头
 		if k != "Connection" && k != "Keep-Alive" && k != "Proxy-Authenticate" && k != "Proxy-Authorization" && k != "Te" && k != "Trailers" && k != "Transfer-Encoding" && k != "Upgrade" {
 			headers[k] = v
 		}
@@ -298,27 +313,72 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		ID:   reqID,
 		Type: "http_request",
 		Payload: map[string]interface{}{
-			"method": r.Method,
-			// 假设前端知道如何处理这个相对URL，或者您在这里构建完整的外部URL
+			"method":  r.Method,
 			"url":     "https://generativelanguage.googleapis.com" + r.URL.String(),
 			"headers": headers,
-			"body":    string(bodyBytes), // 对于二进制数据，应使用base64编码
+			"body":    string(bodyBytes),
 		},
 	}
 
-	// 6. 发送请求到WebSocket客户端
-	if err := selectedConn.safeWriteJSON(requestPayload); err != nil {
-		log.Printf("Failed to send request over WebSocket: %v", err)
-		http.Error(w, "Bad Gateway: Failed to send request to client", http.StatusBadGateway)
+	// 4. 智能选择WebSocket连接并实现重试
+	var selectedConn *UserConnection
+	var requestSent bool
+
+	// 获取用户连接总数以确定最大重试次数
+	globalPool.RLock()
+	userConns, exists := globalPool.Users[userID]
+	globalPool.RUnlock()
+
+	if !exists {
+		log.Printf("No connection pool found for user %s", userID)
+		http.Error(w, "Service Unavailable: No client connections available", http.StatusServiceUnavailable)
+		return
+	}
+
+	maxRetries := len(userConns.Connections)
+	if maxRetries == 0 {
+		log.Printf("No connections found for user %s", userID)
+		http.Error(w, "Service Unavailable: No client connections available", http.StatusServiceUnavailable)
+		return
+	}
+
+	for i := 0; i < maxRetries; i++ {
+		selectedConn, err = globalPool.GetConnection(userID)
+		if err != nil {
+			log.Printf("Attempt %d/%d for user %s: Could not get a healthy connection: %v", i+1, maxRetries, userID, err)
+			// 如果GetConnection返回错误，说明可能被熔断或没有健康连接了
+			break
+		}
+
+		// 6. 发送请求到WebSocket客户端
+		if err := selectedConn.safeWriteJSON(requestPayload); err != nil {
+			log.Printf("Attempt %d/%d for user %s: Failed to send request over connection to %s: %v. Marking as unhealthy.", i+1, maxRetries, userID, selectedConn.Conn.RemoteAddr(), err)
+			// 发送失败，标记连接为不健康
+			selectedConn.IsHealthy = false
+			selectedConn.Status = "unhealthy"
+			selectedConn.lastError = err
+			continue // 继续下一次循环，尝试下一个连接
+		}
+
+		// 发送成功
+		log.Printf("Successfully sent request to user %s on attempt %d/%d", userID, i+1, maxRetries)
+		requestSent = true
+		break
+	}
+
+	// 循环结束后检查是否成功发送
+	if !requestSent {
+		log.Printf("All %d connection attempts failed for user %s.", maxRetries, userID)
+		http.Error(w, "Service Unavailable: All client connections failed", http.StatusServiceUnavailable)
 		return
 	}
 
 	// 7. 异步等待并处理响应
-	processWebSocketResponse(w, r, respChan)
+	processWebSocketResponse(w, r, respChan, userID)
 }
 
 // processWebSocketResponse 处理来自WS通道的响应，构建HTTP响应
-func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan chan *WSMessage) {
+func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan chan *WSMessage, userID string) {
 	// 设置超时
 	ctx, cancel := context.WithTimeout(r.Context(), proxyRequestTimeout)
 	defer cancel()
@@ -399,6 +459,23 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 					if code, ok := msg.Payload["status"].(float64); ok {
 						statusCode = int(code)
 					}
+
+					// --- 429 熔断逻辑 ---
+					if statusCode == http.StatusTooManyRequests {
+						globalPool.RLock()
+						userConns, exists := globalPool.Users[userID]
+						globalPool.RUnlock()
+
+						if exists {
+							userConns.Lock()
+							// 设置1分钟的熔断
+							breakerDuration := 1 * time.Minute
+							userConns.circuitBreakerUntil = time.Now().Add(breakerDuration)
+							log.Printf("CIRCUIT BREAKER TRIGGERED for user %s. Rate limited (429). Blocking requests for %v.", userID, breakerDuration)
+							userConns.Unlock()
+						}
+					}
+
 					http.Error(w, errMsg, statusCode)
 				} else {
 					// 如果已经开始发送流，我们只能记录错误并关闭连接
@@ -421,6 +498,69 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 			}
 			return
 		}
+	}
+}
+
+// --- 5. 后台健康检查 ---
+
+// startHealthCheckRoutine 启动一个后台goroutine，定期检查并恢复/清理不健康的连接
+func startHealthCheckRoutine() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		log.Println("Health Check: Starting routine...")
+		globalPool.RLock()
+		// 复制用户ID列表以避免在迭代时长时间持有锁
+		userIDs := make([]string, 0, len(globalPool.Users))
+		for uid := range globalPool.Users {
+			userIDs = append(userIDs, uid)
+		}
+		globalPool.RUnlock()
+
+		for _, userID := range userIDs {
+			globalPool.RLock()
+			userConns, exists := globalPool.Users[userID]
+			globalPool.RUnlock()
+
+			if !exists {
+				continue
+			}
+
+			userConns.Lock()
+			// 同样，复制连接以避免在迭代时持有锁
+			connsToCheck := make([]*UserConnection, 0, len(userConns.Connections))
+			for _, conn := range userConns.Connections {
+				if !conn.IsHealthy {
+					connsToCheck = append(connsToCheck, conn)
+				}
+			}
+			userConns.Unlock()
+
+			for _, conn := range connsToCheck {
+				// 尝试发送ping来检查连接
+				// 设置一个短暂的写入超时
+				conn.writeMutex.Lock()
+				conn.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				err := conn.Conn.WriteMessage(websocket.PingMessage, nil)
+				conn.Conn.SetWriteDeadline(time.Time{}) // 清除超时
+				conn.writeMutex.Unlock()
+
+				if err == nil {
+					// Ping成功，恢复连接
+					conn.IsHealthy = true
+					conn.Status = "active"
+					conn.lastError = nil
+					log.Printf("Health Check: Connection for user %s (%s) recovered and marked as healthy.", userID, conn.Conn.RemoteAddr())
+				} else {
+					// Ping失败，移除连接
+					log.Printf("Health Check: Ping failed for user %s (%s), removing connection. Error: %v", userID, conn.Conn.RemoteAddr(), err)
+					globalPool.RemoveConnection(userID, conn.Conn)
+					conn.Conn.Close() // 确保关闭底层连接
+				}
+			}
+		}
+		log.Println("Health Check: Routine finished.")
 	}
 }
 
@@ -524,6 +664,9 @@ func main() {
 
 	// HTTP 反向代理路由 (捕获所有其他请求)
 	http.HandleFunc("/", handleProxyRequest)
+
+	// 启动后台健康检查
+	go startHealthCheckRoutine()
 
 	log.Printf("Starting server on %s", proxyListenAddr)
 	log.Printf("WebSocket endpoint available at ws://%s%s", proxyListenAddr, wsPath)

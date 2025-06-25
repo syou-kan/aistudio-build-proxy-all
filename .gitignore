@@ -1,1 +1,5 @@
 .DS_Store
+camoufox-py/cookies/
+camoufox-py/log/
+camoufox-py/config.yaml
+docker-compose.yml
